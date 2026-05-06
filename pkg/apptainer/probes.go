@@ -201,7 +201,7 @@ runProbe() {
         date -Is --utc > "$probe_timestamp_file"
 
         if [ "$probe_type" = "http" ]; then
-            executeHTTPProbe "${probe_args[@]}" "$container_name"
+            executeHTTPProbe "${probe_args[@]}" "$timeout" "$container_name"
         elif [ "$probe_type" = "exec" ]; then
             executeExecProbe "$timeout" "$container_name" "${probe_args[@]}"
         fi
@@ -276,7 +276,7 @@ runStartupProbe() {
 
     while true; do
         if [ "$probe_type" = "http" ]; then
-            executeHTTPProbe "${probe_args[@]}" "$container_name"
+            executeHTTPProbe "${probe_args[@]}" "$timeout" "$container_name"
         elif [ "$probe_type" = "exec" ]; then
             executeExecProbe "$timeout" "$container_name" "${probe_args[@]}"
         fi
