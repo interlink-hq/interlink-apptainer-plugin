@@ -1,0 +1,618 @@
+package apptainer
+
+import (
+	"context"
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestStringToHex(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "simple string",
+			input:    "test",
+			expected: "74657374",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "string with spaces",
+			input:    "a b",
+			expected: "6162",
+		},
+		{
+			name:     "special characters",
+			input:    "a-b_c",
+			expected: "612d625f63",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stringToHex(tt.input)
+			if result != tt.expected {
+				t.Errorf("stringToHex(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParsingTimeFromString(t *testing.T) {
+	ctx := context.Background()
+	timestampFormat := "2006-01-02 15:04:05.999999999 -0700 MST"
+
+	tests := []struct {
+		name        string
+		input       string
+		shouldError bool
+	}{
+		{
+			name:        "valid timestamp",
+			input:       "2024-01-15 10:30:45.123456789 +0000 UTC",
+			shouldError: false,
+		},
+		{
+			name:        "invalid format - missing fields",
+			input:       "2024-01-15 10:30:45",
+			shouldError: true,
+		},
+		{
+			name:        "invalid format - wrong separator",
+			input:       "2024-01-15T10:30:45.123456789+0000UTC",
+			shouldError: true,
+		},
+		{
+			name:        "empty string",
+			input:       "",
+			shouldError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := parsingTimeFromString(ctx, tt.input, timestampFormat)
+			if tt.shouldError {
+				if err == nil {
+					t.Errorf("parsingTimeFromString(%q) expected error but got nil", tt.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parsingTimeFromString(%q) unexpected error: %v", tt.input, err)
+				}
+				if result.IsZero() {
+					t.Errorf("parsingTimeFromString(%q) returned zero time", tt.input)
+				}
+			}
+		})
+	}
+}
+
+func TestPrepareImage(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name             string
+		config           ApptainerConfig
+		metadata         metav1.ObjectMeta
+		containerImage   string
+		expectedContains string
+	}{
+		{
+			name: "image with default prefix",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "ubuntu:latest",
+			expectedContains: "docker://ubuntu:latest",
+		},
+		{
+			name: "image with custom prefix from slurm annotation (backwards compat)",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					"slurm-job.vk.io/image-root": "oras://",
+				},
+			},
+			containerImage:   "myimage:v1",
+			expectedContains: "oras://myimage:v1",
+		},
+		{
+			name: "image with custom prefix from apptainer annotation",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					"apptainer-job.vk.io/image-root": "oras://",
+				},
+			},
+			containerImage:   "myimage:v2",
+			expectedContains: "oras://myimage:v2",
+		},
+		{
+			name: "absolute path image",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "/path/to/image.sif",
+			expectedContains: "/path/to/image.sif",
+		},
+		{
+			name: "image already has docker:// prefix",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "docker://nginx:alpine",
+			expectedContains: "docker://nginx:alpine",
+		},
+		{
+			name: "oras image not double-prefixed with docker",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "oras://myregistry.example.com/myimage:v1",
+			expectedContains: "oras://myregistry.example.com/myimage:v1",
+		},
+		{
+			name: "library image not double-prefixed",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "library://user/collection/image:tag",
+			expectedContains: "library://user/collection/image:tag",
+		},
+		{
+			name: "shub image not double-prefixed",
+			config: ApptainerConfig{
+				ImagePrefix: "docker://",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "shub://vsoch/hello-world",
+			expectedContains: "shub://vsoch/hello-world",
+		},
+		{
+			name: "empty prefix with plain image",
+			config: ApptainerConfig{
+				ImagePrefix: "",
+			},
+			metadata:         metav1.ObjectMeta{},
+			containerImage:   "busybox:1.35",
+			expectedContains: "busybox:1.35",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := prepareImage(ctx, tt.config, tt.metadata, tt.containerImage)
+			if result != tt.expectedContains {
+				t.Errorf("prepareImage() = %q, want %q", result, tt.expectedContains)
+			}
+		})
+	}
+}
+
+// TestProduceApptainerScript verifies that produceApptainerScript generates job.sh
+// (and no job.slurm), that the script has the correct shebang and helper functions,
+// and that it includes the container run commands.
+func TestProduceApptainerScript(t *testing.T) {
+	ctx := context.Background()
+	workingDir := t.TempDir()
+
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			UID:       "aaaabbbb-cccc-dddd-eeee-000011112222",
+		},
+	}
+
+	config := ApptainerConfig{
+		BashPath:      "/bin/bash",
+		ApptainerPath: "/usr/bin/apptainer",
+		ApptainerDefaultOptions: []string{"--no-eval", "--containall"},
+	}
+
+	commands := []ContainerCommand{
+		{
+			containerName:   "mycontainer",
+			isInitContainer: false,
+			runtimeCommand:  []string{"/usr/bin/apptainer", "run", "--no-eval", "--containall", "docker://alpine:latest"},
+			containerImage:  "docker://alpine:latest",
+		},
+	}
+
+	scriptPath, err := produceApptainerScript(ctx, config, pod, workingDir, pod.ObjectMeta, commands)
+	if err != nil {
+		t.Fatalf("produceApptainerScript() unexpected error: %v", err)
+	}
+
+	// job.sh must exist
+	if _, err := os.Stat(scriptPath); err != nil {
+		t.Fatalf("job.sh not created at %s: %v", scriptPath, err)
+	}
+	if !strings.HasSuffix(scriptPath, "job.sh") {
+		t.Errorf("returned path %q should end with job.sh", scriptPath)
+	}
+
+	// job.slurm must NOT exist (apptainer plugin skips sbatch submission)
+	jobSlurm := filepath.Join(workingDir, "job.slurm")
+	if _, err := os.Stat(jobSlurm); err == nil {
+		t.Error("job.slurm should NOT be created by produceApptainerScript (no SLURM submission)")
+	}
+
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read job.sh: %v", err)
+	}
+	s := string(content)
+
+	// Must start with bash shebang
+	if !strings.HasPrefix(s, "#!/bin/bash") {
+		t.Errorf("job.sh must start with #!/bin/bash, got: %q", s[:min(len(s), 30)])
+	}
+
+	// Must contain helper functions
+	for _, fn := range []string{"runCtn", "waitCtns", "endScript", "waitFileExist"} {
+		if !strings.Contains(s, fn) {
+			t.Errorf("job.sh missing expected helper function %q", fn)
+		}
+	}
+
+	// Must contain the container name
+	if !strings.Contains(s, "mycontainer") {
+		t.Error("job.sh does not contain container name 'mycontainer'")
+	}
+}
+
+func TestCheckIfJidExists(t *testing.T) {
+	ctx := context.Background()
+	jids := make(map[string]*JidStruct)
+
+	// Add some test data.
+	jids["uid-1"] = &JidStruct{
+		PodUID:       "uid-1",
+		PodNamespace: "default",
+		JID:          "12345",
+		StartTime:    time.Now(),
+	}
+
+	tests := []struct {
+		name     string
+		uid      string
+		expected bool
+	}{
+		{
+			name:     "existing JID",
+			uid:      "uid-1",
+			expected: true,
+		},
+		{
+			name:     "non-existing JID",
+			uid:      "uid-2",
+			expected: false,
+		},
+		{
+			name:     "empty uid",
+			uid:      "",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := checkIfJidExists(ctx, &jids, tt.uid)
+			if result != tt.expected {
+				t.Errorf("checkIfJidExists(%q) = %v, want %v", tt.uid, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRemoveJID(t *testing.T) {
+	jids := make(map[string]*JidStruct)
+	jids["uid-1"] = &JidStruct{
+		PodUID:       "uid-1",
+		PodNamespace: "default",
+		JID:          "12345",
+	}
+	jids["uid-2"] = &JidStruct{
+		PodUID:       "uid-2",
+		PodNamespace: "default",
+		JID:          "67890",
+	}
+
+	removeJID("uid-1", &jids)
+
+	if _, exists := jids["uid-1"]; exists {
+		t.Error("removeJID() failed to remove uid-1")
+	}
+
+	if _, exists := jids["uid-2"]; !exists {
+		t.Error("removeJID() incorrectly removed uid-2")
+	}
+}
+
+// TestPrepareMountsSimpleVolumeProjectedHeredoc verifies that when SHARED_FS is
+// not set (non-shared filesystem mode), multiline projected volume data is written
+// using a base64-encoded heredoc so that newlines are preserved when the plugin
+// exports environment variables for non-shared-FS nodes.
+func TestPrepareMountsSimpleVolumeProjectedHeredoc(t *testing.T) {
+	ctx := context.Background()
+	workingDir := t.TempDir()
+
+	// Ensure SHARED_FS is unset so the non-shared-fs code path is exercised.
+	t.Setenv("SHARED_FS", "false")
+
+	multilineCert := "-----BEGIN CERTIFICATE-----\n" +
+		"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n" +
+		"test\n" +
+		"-----END CERTIFICATE-----\n"
+
+	defaultMode := int32(0644)
+	projectedVolume := v1.Volume{
+		Name: "kube-api-access",
+		VolumeSource: v1.VolumeSource{
+			Projected: &v1.ProjectedVolumeSource{
+				DefaultMode: &defaultMode,
+				Sources:     []v1.VolumeProjection{},
+			},
+		},
+	}
+
+	volumeMount := v1.VolumeMount{
+		Name:      "kube-api-access",
+		MountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+	}
+
+	container := &v1.Container{
+		Name: "mycontainer",
+		VolumeMounts: []v1.VolumeMount{
+			volumeMount,
+		},
+	}
+
+	configMap := v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kube-api-access",
+		},
+		Data: map[string]string{
+			"ca.crt": multilineCert,
+		},
+	}
+
+	config := ApptainerConfig{
+		ExportPodData: true,
+	}
+
+	// Reset the global prefix before the test.
+	prefix = ""
+
+	var mountedDataSB strings.Builder
+	err := prepareMountsSimpleVolume(ctx, config, container, workingDir, configMap, volumeMount, projectedVolume, &mountedDataSB)
+	if err != nil {
+		t.Fatalf("prepareMountsSimpleVolume() unexpected error: %v", err)
+	}
+
+	// The generated prefix must use a base64-decoded heredoc so that newlines are preserved.
+	if !strings.Contains(prefix, "base64 -d <<'") {
+		t.Errorf("prefix does not contain base64 heredoc (base64 -d <<'): prefix = %q", prefix)
+	}
+	if strings.Contains(prefix, "echo \"${") {
+		t.Errorf("prefix must not use echo to write file content: prefix = %q", prefix)
+	}
+
+	// The mkdir -p command must use an absolute path.
+	if !strings.Contains(prefix, "mkdir -p \"/") {
+		t.Errorf("prefix mkdir -p must use an absolute path (got relative): prefix = %q", prefix)
+	}
+
+	// Extract the base64 content from the heredoc and verify round-trip.
+	const heredocCmdPrefix = "base64 -d <<'"
+	cmdIdx := strings.Index(prefix, heredocCmdPrefix)
+	if cmdIdx == -1 {
+		t.Fatalf("could not find heredoc command in prefix: %q", prefix)
+	}
+	markerStart := cmdIdx + len(heredocCmdPrefix)
+	markerEnd := strings.Index(prefix[markerStart:], "'")
+	if markerEnd == -1 {
+		t.Fatalf("could not find closing quote for heredoc marker in prefix: %q", prefix)
+	}
+	marker := prefix[markerStart : markerStart+markerEnd]
+
+	contentStart := markerStart + markerEnd + 1 // skip closing quote
+	newlineAfterCmd := strings.Index(prefix[contentStart:], "\n")
+	if newlineAfterCmd == -1 {
+		t.Fatalf("could not find newline after heredoc command in prefix: %q", prefix)
+	}
+	contentStart += newlineAfterCmd + 1
+	markerLine := "\n" + marker
+	contentEnd := strings.Index(prefix[contentStart:], markerLine)
+	if contentEnd == -1 {
+		t.Fatalf("could not find closing heredoc marker %q in prefix: %q", marker, prefix)
+	}
+	b64Content := prefix[contentStart : contentStart+contentEnd]
+
+	decoded, err := base64.StdEncoding.DecodeString(b64Content)
+	if err != nil {
+		t.Fatalf("failed to decode base64 content %q: %v", b64Content, err)
+	}
+	if string(decoded) != multilineCert {
+		t.Errorf("decoded content = %q, want %q", string(decoded), multilineCert)
+	}
+
+	// The prefix must end with exactly the heredoc end-marker on its own line.
+	if !strings.HasSuffix(prefix, "\n"+marker) {
+		t.Errorf("prefix must end with \"\\n%s\" so the heredoc terminator is on its own line; got suffix %q",
+			marker, prefix[max(0, len(prefix)-len(marker)-20):])
+	}
+}
+
+// TestPrepareMountsSimpleVolumeProjectedSharedFS verifies that when SHARED_FS=true,
+// multiline projected volume data is written directly to the filesystem and no
+// heredoc is added to the script prefix.
+func TestPrepareMountsSimpleVolumeProjectedSharedFS(t *testing.T) {
+	ctx := context.Background()
+	workingDir := t.TempDir()
+
+	t.Setenv("SHARED_FS", "true")
+
+	multilineCert := "-----BEGIN CERTIFICATE-----\n" +
+		"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n" +
+		"test\n" +
+		"-----END CERTIFICATE-----\n"
+
+	defaultMode := int32(0644)
+	projectedVolume := v1.Volume{
+		Name: "kube-api-access",
+		VolumeSource: v1.VolumeSource{
+			Projected: &v1.ProjectedVolumeSource{
+				DefaultMode: &defaultMode,
+				Sources:     []v1.VolumeProjection{},
+			},
+		},
+	}
+
+	volumeMount := v1.VolumeMount{
+		Name:      "kube-api-access",
+		MountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+	}
+
+	container := &v1.Container{
+		Name: "mycontainer",
+		VolumeMounts: []v1.VolumeMount{
+			volumeMount,
+		},
+	}
+
+	configMap := v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kube-api-access",
+		},
+		Data: map[string]string{
+			"ca.crt": multilineCert,
+		},
+	}
+
+	config := ApptainerConfig{
+		ExportPodData: true,
+	}
+
+	// Reset the global prefix before the test.
+	prefix = ""
+
+	var mountedDataSB strings.Builder
+	err := prepareMountsSimpleVolume(ctx, config, container, workingDir, configMap, volumeMount, projectedVolume, &mountedDataSB)
+	if err != nil {
+		t.Fatalf("prepareMountsSimpleVolume() unexpected error: %v", err)
+	}
+
+	// With SHARED_FS=true the plugin writes files directly; no heredoc should be added.
+	if strings.Contains(prefix, "base64 -d <<'") {
+		t.Errorf("prefix must not contain base64 heredoc with SHARED_FS=true: prefix = %q", prefix)
+	}
+
+	// The file must exist on the shared filesystem with byte-for-byte correct content.
+	expectedFilePath := filepath.Join(workingDir, "projectedVolumeMaps", volumeMount.Name, "ca.crt")
+	gotBytes, err := os.ReadFile(expectedFilePath)
+	if err != nil {
+		t.Fatalf("os.WriteFile did not create file %s: %v", expectedFilePath, err)
+	}
+	if string(gotBytes) != multilineCert {
+		t.Errorf("file content = %q, want %q", string(gotBytes), multilineCert)
+	}
+
+	// The bind mount path must be included in the mounts string.
+	mounts := mountedDataSB.String()
+	if !strings.Contains(mounts, expectedFilePath) {
+		t.Errorf("mountedDataSB does not contain expected host path %q: got %q", expectedFilePath, mounts)
+	}
+	containerMountPath := filepath.Join(volumeMount.MountPath, "ca.crt")
+	if !strings.Contains(mounts, containerMountPath) {
+		t.Errorf("mountedDataSB does not contain expected container path %q: got %q", containerMountPath, mounts)
+	}
+}
+
+// TestNormalizeVolumeFileContent verifies that normalizeVolumeFileContent properly
+// handles the common misconfiguration where a PEM certificate (or any multiline
+// value) is stored without a block scalar (|), causing the YAML parser to deliver
+// literal \n sequences instead of real newlines.
+func TestNormalizeVolumeFileContent(t *testing.T) {
+	const pemWithRealNewlines = "-----BEGIN CERTIFICATE-----\nMIIFakeCert==\n-----END CERTIFICATE-----\n"
+	const pemWithLiteralBackslashN = `-----BEGIN CERTIFICATE-----\nMIIFakeCert==\n-----END CERTIFICATE-----\n`
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "already has real newlines - no change",
+			input: pemWithRealNewlines,
+			want:  pemWithRealNewlines,
+		},
+		{
+			name:  "literal backslash-n only - unescape to real newlines",
+			input: pemWithLiteralBackslashN,
+			want:  pemWithRealNewlines,
+		},
+		{
+			name:  "plain text without any newlines or escape sequences - no change",
+			input: "hello world",
+			want:  "hello world",
+		},
+		{
+			name:  "mixed real newlines and literal backslash-n - no change (real newlines present)",
+			input: "line1\nli\\ne2\nline3\n",
+			want:  "line1\nli\\ne2\nline3\n",
+		},
+		{
+			name:  "empty string - no change",
+			input: "",
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeVolumeFileContent(tc.input)
+			if string(got) != tc.want {
+				t.Errorf("normalizeVolumeFileContent(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
