@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -74,7 +73,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 	if caCrtFilePath != "" {
 		log.G(ctx).Info("CA certificate provided, setting up mutual TLS")
 
-		caCert, err := ioutil.ReadFile(caCrtFilePath)
+		caCert, err := os.ReadFile(caCrtFilePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load CA certificate: %w", err)
 		}
